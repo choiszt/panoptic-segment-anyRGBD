@@ -1,0 +1,26 @@
+accelerate
+addict
+diffusers
+gradio==3.27.0
+huggingface_hub
+matplotlib
+numpy
+onnxruntime
+opencv_python
+Pillow
+pycocotools
+PyYAML
+requests
+setuptools
+supervision
+termcolor
+timm
+torch
+torchvision
+transformers
+yapf
+segment_anything
+scikit-image
+segments-ai
+--extra-index-url https://download.pytorch.org/whl/cu113
+torch
