@@ -130,3 +130,5 @@ dmypy.json
 
 .vscode
 images/*
+results/*
+sol_5_mcs_1/*

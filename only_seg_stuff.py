@@ -29,8 +29,7 @@ from segment_anything import build_sam, SamPredictor
 
 # CLIPSeg
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
-
-
+from pinmask import maskpinner
 def load_model_hf(model_config_path, filename, device):
     args = SLConfig.fromfile(model_config_path)
     model = build_model(args)
@@ -269,9 +268,9 @@ def inds_to_segments_format(
 
 
 def generate_panoptic_mask(
-    image,
-    thing_category_names_string,
+    imagebatch,
     stuff_category_names_string,
+    maskbatch_input,
     dino_box_threshold=0.3,
     dino_text_threshold=0.25,
     segmentation_background_threshold=0.1,
@@ -280,120 +279,72 @@ def generate_panoptic_mask(
     task_attributes_json="",
 ):
         # parse inputs
-    thing_category_names = [
-        thing_category_name.strip()
-        for thing_category_name in thing_category_names_string.split(",")
-    ]
     stuff_category_names = [
         stuff_category_name.strip()
         for stuff_category_name in stuff_category_names_string.split(",")
     ]
-    category_names = thing_category_names + stuff_category_names
     category_name_to_id = {
-        category_name: i for i, category_name in enumerate(category_names)
+        category_name: i for i, category_name in enumerate(stuff_category_names)
     }         #category:id
-    image=Image.open(image)
-    image = image.convert("RGB")
-    image_array = np.asarray(image)
-
-    # compute SAM image embedding
-    sam_predictor.set_image(image_array)
-
-    # detect boxes for "thing" categories using Grounding DINO
-    thing_category_ids = []
-    thing_masks = []
-    thing_boxes = []
-    detected_thing_category_names = []
-    if len(thing_category_names) > 0:
-        thing_boxes, thing_category_ids, detected_thing_category_names = dino_detection(
-            dino_model,
-            image,
-            image_array,
-            thing_category_names,
-            category_name_to_id,
-            dino_box_threshold,
-            dino_text_threshold,
-            device,
-        )
-        if len(thing_boxes) > 0:
-            # get segmentation masks for the thing boxes
-            thing_masks = sam_masks_from_dino_boxes(
-                sam_predictor, image_array, thing_boxes, device
-            )  #由dino得到thing的mask
-    if len(stuff_category_names) > 0:
-        # get rough segmentation masks for "stuff" categories using CLIPSeg
-        clipseg_preds, clipseg_semantic_inds = clipseg_segmentation(
-            clipseg_processor,
-            clipseg_model,
-            image,
-            stuff_category_names,
-            segmentation_background_threshold,
-            device,
-        )
-        # remove things from stuff masks
-        clipseg_semantic_inds_without_things = clipseg_semantic_inds.clone()
-        if len(thing_boxes) > 0:
-            combined_things_mask = torch.any(thing_masks, dim=0) #如果这些位置有object 没有stuff
-            clipseg_semantic_inds_without_things[combined_things_mask[0]] = 0
-        # clip CLIPSeg preds based on non-overlapping semantic segmentation inds (+ optionally shrink the mask of each category)
-        # also returns the relative size of each category
-        clipsed_clipped_preds, relative_sizes = clip_and_shrink_preds(
-            clipseg_semantic_inds_without_things,
-            clipseg_preds,
-            shrink_kernel_size,
-            len(stuff_category_names) + 1,
-        )
-        # get finer segmentation masks for the "stuff" categories using SAM
-        sam_preds = torch.zeros_like(clipsed_clipped_preds)
-        for i in range(clipsed_clipped_preds.shape[0]):
-            clipseg_pred = clipsed_clipped_preds[i]
-            # for each "stuff" category, sample points in the rough segmentation mask
-            num_samples = int(relative_sizes[i] * num_samples_factor)
-            if num_samples == 0:
-                continue
-            points = sample_points_based_on_preds(
-                clipseg_pred.cpu().numpy(), num_samples
+    pinner=maskpinner()
+    colordict=pinner.colordict(maskbatch_input)
+    import cv2
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    name=imagebatch[0].split('/')[-3]
+    out = cv2.VideoWriter(f'/mnt/ve_share/liushuai/panoptic-segment-anything/results/{name}.mp4', fourcc, 5, (1280,800))
+    import tqdm
+    for image,mask in tqdm.tqdm(zip(imagebatch,maskbatch_input)):
+        imagepath=image
+        image=Image.open(image)
+        image = image.convert("RGB")
+        image_array = np.asarray(image)
+        # compute SAM image embedding
+        sam_predictor.set_image(image_array)
+        # detect boxes for "thing" categories using Grounding DINO
+        if len(stuff_category_names) > 0:
+            # get rough segmentation masks for "stuff" categories using CLIPSeg
+            clipseg_preds, clipseg_semantic_inds = clipseg_segmentation(
+                clipseg_processor,
+                clipseg_model,
+                image,
+                stuff_category_names,
+                segmentation_background_threshold,
+                device,
             )
-            if len(points) == 0:
-                continue
-            # use SAM to get mask for points
-            pred = sam_mask_from_points(sam_predictor, image_array, points)
-            sam_preds[i] = pred
-        sam_semantic_inds = preds_to_semantic_inds(
-            sam_preds, segmentation_background_threshold
-        )
-
-    # combine the thing inds and the stuff inds into panoptic inds
-    panoptic_inds = (
-        sam_semantic_inds.clone()
-        if len(stuff_category_names) > 0
-        else torch.zeros(image_array.shape[0], image_array.shape[1], dtype=torch.long)
-    )
-    ind = len(stuff_category_names) + 1
-    for thing_mask in thing_masks:
-        # overlay thing mask on panoptic inds
-        panoptic_inds[thing_mask.squeeze(dim=0)] = ind
-        ind += 1
-
-    panoptic_bool_masks = (
-        semantic_inds_to_shrunken_bool_masks(panoptic_inds, 0, ind + 1)
-        .numpy()
-        .astype(int)
-    )
-    panoptic_names = (
-        ["unlabeled"] + stuff_category_names + detected_thing_category_names
-    )
-    subsection_label_pairs = [
-        (panoptic_bool_masks[i], panoptic_name)
-        for i, panoptic_name in enumerate(panoptic_names)
-    ]
-
-    segmentation_bitmap, annotations = inds_to_segments_format(
-        panoptic_inds, thing_category_ids, stuff_category_names, category_name_to_id
-    )
-    annotations_json = json.dumps(annotations)
-
-    return (image_array, subsection_label_pairs), segmentation_bitmap, annotations_json
+            # remove things from stuff masks
+            clipseg_semantic_inds_without_things = clipseg_semantic_inds.clone()
+            # clip CLIPSeg preds based on non-overlapping semantic segmentation inds (+ optionally shrink the mask of each category)
+            # also returns the relative size of each category
+            clipsed_clipped_preds, relative_sizes = clip_and_shrink_preds(
+                clipseg_semantic_inds_without_things,
+                clipseg_preds,
+                shrink_kernel_size,
+                len(stuff_category_names) + 1,
+            )
+            # get finer segmentation masks for the "stuff" categories using SAM
+            sam_preds = torch.zeros_like(clipsed_clipped_preds)
+            for i in range(clipsed_clipped_preds.shape[0]):
+                clipseg_pred = clipsed_clipped_preds[i]
+                # for each "stuff" category, sample points in the rough segmentation mask
+                num_samples = int(relative_sizes[i] * num_samples_factor)
+                if num_samples == 0:
+                    continue
+                points = sample_points_based_on_preds(
+                    clipseg_pred.cpu().numpy(), num_samples
+                )
+                if len(points) == 0:
+                    continue
+                # use SAM to get mask for points
+                pred = sam_mask_from_points(sam_predictor, image_array, points)
+                sam_preds[i] = pred
+            sam_semantic_inds = preds_to_semantic_inds(
+                sam_preds, segmentation_background_threshold
+            )
+            sam_semantic_inds=sam_semantic_inds.numpy()
+            pinner.getpinnedmask(sam_semantic_inds,mask)
+            pinnedimage=pinner.drawmask(colordict,imagepath)
+            out.write(pinnedimage)
+    out.release()
 
 
 config_file = "/mnt/ve_share/liushuai/panoptic-segment-anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
@@ -429,7 +380,12 @@ clipseg_model.to(device)
 if __name__ == "__main__":
     things="person, car, motorcycle, truck, bird, dog, handbag, suitcase, bottle, cup, bowl, chair, potted plant, bed, dining table, tv, laptop, cell phone, bag, bin, box, door, road barrier, stick"
     stuff="floor, ground, wall, window, stair, fence, grass, sky"
-    inputbatch=["/mnt/ve_share/liushuai/panoptic-segment-anything/images/000000.bmp"]
-    for img in inputbatch:
-        generate_panoptic_mask(img,things,stuff)
+    RGBroot="/mnt/ve_share/liushuai/panoptic-segment-anything/sol_5_mcs_1/images"
+    maskroot="/mnt/ve_share/liushuai/panoptic-segment-anything/sol_5_mcs_1/visible"
+    getbatch=lambda x:sorted(os.path.join(x,i) for i in os.listdir(x))
+    rgbbatch_input=getbatch(RGBroot)
+    maskbatch_input=getbatch(maskroot)
+    # inputbatch=["/mnt/ve_share/liushuai/panoptic-segment-anything/sol_5_mcs_1/images/000000.bmp"]
+    # maskbatch_input=["/mnt/ve_share/liushuai/panoptic-segment-anything/sol_5_mcs_1/visible/000000.npy"]
+    generate_panoptic_mask(rgbbatch_input,stuff,maskbatch_input)
 
